@@ -279,7 +279,7 @@ def parse_args() -> argparse.Namespace:
 
 def load_hparams_from_hf(hf_model_id: str) -> dict[str, Any]:
     # normally, adapter does not come with base model config, we need to load it from AutoConfig
-    config = AutoConfig.from_pretrained(hf_model_id)
+    config = AutoConfig.from_pretrained(hf_model_id, token = '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')
     return config.to_dict()
 
 

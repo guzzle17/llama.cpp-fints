@@ -629,6 +629,55 @@ extern "C" {
                          int32_t   il_start,
                          int32_t   il_end);
 
+    // FINTs: Apply fine-grained control vectors (separate for attention and MLP)
+    // attn_data: control vector for attention layers
+    // mlp_data: control vector for MLP/FFN layers
+    // Both should be n_embd x n_layers buffers starting from layer 1
+    LLAMA_API int32_t llama_apply_adapter_cvec_fints(
+            struct llama_context * ctx,
+                     const float * attn_data,
+                     const float * mlp_data,
+                          size_t   len,
+                         int32_t   n_embd,
+                         int32_t   il_start,
+                         int32_t   il_end);
+
+    // FINTs: Activation extraction for generating control vectors
+    // Enable/disable activation extraction mode
+    LLAMA_API void llama_set_activation_extraction(
+            struct llama_context * ctx,
+                            bool   enabled);
+
+    // Clear all stored activations
+    LLAMA_API void llama_clear_activations(
+            struct llama_context * ctx);
+
+    // Get number of layers and embedding dimension
+    LLAMA_API void llama_get_activation_info(
+            struct llama_context * ctx,
+                         int32_t * n_layer,
+                         int32_t * n_embd);
+
+    // Retrieve extracted activations for a specific layer
+    // attn_out and mlp_out should point to buffers of size [n_tokens * n_embd]
+    // Returns number of tokens extracted for that layer
+    LLAMA_API int32_t llama_get_layer_activations(
+            struct llama_context * ctx,
+                         int32_t   layer,
+                           float * attn_out,
+                           float * mlp_out,
+                          size_t   buffer_size);
+
+    // Compute FINTs vectors from positive and negative examples
+    // pos_ctx and neg_ctx should have activations extracted from their respective examples
+    // attn_vec_out and mlp_vec_out should point to buffers of size [n_layers * n_embd]
+    LLAMA_API bool llama_compute_fints_vectors(
+            struct llama_context * pos_ctx,
+            struct llama_context * neg_ctx,
+                           float * attn_vec_out,
+                           float * mlp_vec_out,
+                          size_t   buffer_size);
+
     //
     // Memory
     //

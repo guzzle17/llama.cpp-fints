@@ -8,10 +8,197 @@
 #include <cassert>
 #include <sstream>
 #include <stdexcept>
+#include <cstring>
+
+// activation extractor
+
+void llama_activation_extractor::init(int32_t n_layer_, int32_t n_embd_) {
+    n_layer = n_layer_;
+    n_embd = n_embd_;
+    n_tokens = 0;
+    
+    attn_activations.resize(n_layer);
+    mlp_activations.resize(n_layer);
+    token_counts.resize(n_layer, 0);
+    attn_tensors.resize(n_layer, nullptr);
+    mlp_tensors.resize(n_layer, nullptr);
+    
+    for (int il = 0; il < n_layer; ++il) {
+        attn_activations[il].clear();
+        mlp_activations[il].clear();
+    }
+}
+
+void llama_activation_extractor::clear() {
+    for (int il = 0; il < n_layer; ++il) {
+        attn_activations[il].clear();
+        mlp_activations[il].clear();
+        token_counts[il] = 0;
+        attn_tensors[il] = nullptr;
+        mlp_tensors[il] = nullptr;
+    }
+    n_tokens = 0;
+}
+
+void llama_activation_extractor::save_attn(int il, const float * data, int n_tok, int n_emb) {
+    if (il < 0 || il >= n_layer) return;
+    
+    size_t offset = attn_activations[il].size();
+    attn_activations[il].resize(offset + n_tok * n_emb);
+    std::memcpy(attn_activations[il].data() + offset, data, n_tok * n_emb * sizeof(float));
+    token_counts[il] += n_tok;
+}
+
+void llama_activation_extractor::save_mlp(int il, const float * data, int n_tok, int n_emb) {
+    if (il < 0 || il >= n_layer) return;
+    
+    size_t offset = mlp_activations[il].size();
+    mlp_activations[il].resize(offset + n_tok * n_emb);
+    std::memcpy(mlp_activations[il].data() + offset, data, n_tok * n_emb * sizeof(float));
+    // Note: token_counts is already incremented by save_attn, don't double-count
+}
+
+void llama_activation_extractor::extract_from_tensors() {
+    if (!enabled) return;
+    
+    for (int il = 0; il < n_layer; ++il) {
+        // Extract attention activations
+        if (attn_tensors[il] != nullptr && !ggml_is_empty(attn_tensors[il])) {
+            int64_t n_tok = attn_tensors[il]->ne[1];
+            int64_t n_emb = attn_tensors[il]->ne[0];
+            
+            // Debug: print tensor info
+            if (il < 3) {
+                fprintf(stderr, "Layer %d attn: ptr=%p, ne=[%lld,%lld], name=%s\n", 
+                        il, (void*)attn_tensors[il], n_emb, n_tok, attn_tensors[il]->name);
+            }
+            
+            // Validate dimensions
+            if (n_tok > 0 && n_emb > 0 && n_emb == this->n_embd) {
+                std::vector<float> buffer(n_tok * n_emb);
+                ggml_backend_tensor_get(attn_tensors[il], buffer.data(), 0, buffer.size() * sizeof(float));
+                save_attn(il, buffer.data(), n_tok, n_emb);
+            }
+        }
+        
+        // Extract MLP activations
+        if (mlp_tensors[il] != nullptr && !ggml_is_empty(mlp_tensors[il])) {
+            int64_t n_tok = mlp_tensors[il]->ne[1];
+            int64_t n_emb = mlp_tensors[il]->ne[0];
+            
+            // Debug: print tensor info
+            if (il < 3) {
+                fprintf(stderr, "Layer %d MLP:  ptr=%p, ne=[%lld,%lld], name=%s, data=%p\n", 
+                        il, (void*)mlp_tensors[il], n_emb, n_tok, mlp_tensors[il]->name, mlp_tensors[il]->data);
+            }
+            
+            // Validate dimensions
+            if (n_tok > 0 && n_emb > 0 && n_emb == this->n_embd) {
+                std::vector<float> buffer(n_tok * n_emb);
+                ggml_backend_tensor_get(mlp_tensors[il], buffer.data(), 0, buffer.size() * sizeof(float));
+                save_mlp(il, buffer.data(), n_tok, n_emb);
+            }
+        }
+    }
+}
+
+void llama_activation_extractor::compute_vectors(
+    const llama_activation_extractor & positive,
+    const llama_activation_extractor & negative,
+    std::vector<float> & attn_vec_out,
+    std::vector<float> & mlp_vec_out) {
+    
+    if (positive.n_layer != negative.n_layer || positive.n_embd != negative.n_embd) {
+        throw std::runtime_error("Positive and negative extractors have mismatched dimensions");
+    }
+    
+    int32_t n_layer = positive.n_layer;
+    int32_t n_embd = positive.n_embd;
+    
+    // Allocate output: n_layer * n_embd
+    attn_vec_out.resize(n_layer * n_embd, 0.0f);
+    mlp_vec_out.resize(n_layer * n_embd, 0.0f);
+    
+    for (int il = 0; il < n_layer; ++il) {
+        // Compute mean activations for attention
+        std::vector<float> pos_attn_mean(n_embd, 0.0f);
+        std::vector<float> neg_attn_mean(n_embd, 0.0f);
+        
+        if (positive.token_counts[il] > 0) {
+            for (size_t i = 0; i < positive.attn_activations[il].size(); ++i) {
+                pos_attn_mean[i % n_embd] += positive.attn_activations[il][i];
+            }
+            for (int i = 0; i < n_embd; ++i) {
+                pos_attn_mean[i] /= positive.token_counts[il];
+            }
+        }
+        
+        if (negative.token_counts[il] > 0) {
+            for (size_t i = 0; i < negative.attn_activations[il].size(); ++i) {
+                neg_attn_mean[i % n_embd] += negative.attn_activations[il][i];
+            }
+            for (int i = 0; i < n_embd; ++i) {
+                neg_attn_mean[i] /= negative.token_counts[il];
+            }
+        }
+        
+        // Compute difference: pos - neg
+        for (int i = 0; i < n_embd; ++i) {
+            float diff = pos_attn_mean[i] - neg_attn_mean[i];
+            // Clamp to prevent NaN/Inf
+            if (std::isnan(diff) || std::isinf(diff)) {
+                diff = 0.0f;
+            }
+            attn_vec_out[il * n_embd + i] = diff;
+        }
+        
+        // Same for MLP
+        std::vector<float> pos_mlp_mean(n_embd, 0.0f);
+        std::vector<float> neg_mlp_mean(n_embd, 0.0f);
+        
+        if (positive.token_counts[il] > 0) {
+            for (size_t i = 0; i < positive.mlp_activations[il].size(); ++i) {
+                float val = positive.mlp_activations[il][i];
+                // Check for invalid values
+                if (!std::isnan(val) && !std::isinf(val)) {
+                    pos_mlp_mean[i % n_embd] += val;
+                }
+            }
+            for (int i = 0; i < n_embd; ++i) {
+                pos_mlp_mean[i] /= positive.token_counts[il];
+            }
+        }
+        
+        if (negative.token_counts[il] > 0) {
+            for (size_t i = 0; i < negative.mlp_activations[il].size(); ++i) {
+                float val = negative.mlp_activations[il][i];
+                if (!std::isnan(val) && !std::isinf(val)) {
+                    neg_mlp_mean[i % n_embd] += val;
+                }
+            }
+            for (int i = 0; i < n_embd; ++i) {
+                neg_mlp_mean[i] /= negative.token_counts[il];
+            }
+        }
+        
+        for (int i = 0; i < n_embd; ++i) {
+            float diff = pos_mlp_mean[i] - neg_mlp_mean[i];
+            if (std::isnan(diff) || std::isinf(diff)) {
+                diff = 0.0f;
+            }
+            mlp_vec_out[il * n_embd + i] = diff;
+        }
+    }
+}
 
 // vec
 
 ggml_tensor * llama_adapter_cvec::tensor_for(int il) const {
+    // When FINTs is active, don't use regular control vectors
+    if (use_fints) {
+        return nullptr;
+    }
+    
     if (il < 0 || il < layer_start || il > layer_end || (size_t) il >= tensors.size()) {
         return nullptr;
     }
@@ -19,8 +206,40 @@ ggml_tensor * llama_adapter_cvec::tensor_for(int il) const {
     return tensors[il];
 }
 
+ggml_tensor * llama_adapter_cvec::tensor_for_attn(int il) const {
+    if (!use_fints || il < 0 || il < layer_start || il > layer_end || (size_t) il >= tensors_attn.size()) {
+        return nullptr;
+    }
+    return tensors_attn[il];
+}
+
+ggml_tensor * llama_adapter_cvec::tensor_for_mlp(int il) const {
+    if (!use_fints || il < 0 || il < layer_start || il > layer_end || (size_t) il >= tensors_mlp.size()) {
+        return nullptr;
+    }
+    return tensors_mlp[il];
+}
+
 ggml_tensor * llama_adapter_cvec::apply_to(ggml_context * ctx, ggml_tensor * cur, int  il) const {
     ggml_tensor * layer_dir = tensor_for(il);
+    if (layer_dir != nullptr) {
+        cur = ggml_add(ctx, cur, layer_dir);
+    }
+
+    return cur;
+}
+
+ggml_tensor * llama_adapter_cvec::apply_to_attn(ggml_context * ctx, ggml_tensor * cur, int  il) const {
+    ggml_tensor * layer_dir = tensor_for_attn(il);
+    if (layer_dir != nullptr) {
+        cur = ggml_add(ctx, cur, layer_dir);
+    }
+
+    return cur;
+}
+
+ggml_tensor * llama_adapter_cvec::apply_to_mlp(ggml_context * ctx, ggml_tensor * cur, int  il) const {
+    ggml_tensor * layer_dir = tensor_for_mlp(il);
     if (layer_dir != nullptr) {
         cur = ggml_add(ctx, cur, layer_dir);
     }
@@ -127,6 +346,143 @@ bool llama_adapter_cvec::apply(
         const size_t off = n_embd * (il - 1); // buffer doesn't have data for layer 0, since it's never present
         if (off + n_embd <= len) {
             ggml_backend_tensor_set(tensors[il], data + off, 0, n_embd * ggml_element_size(tensors[il]));
+        }
+    }
+
+    return true;
+}
+
+bool llama_adapter_cvec::init_fints(const llama_model & model) {
+    const auto & hparams = model.hparams;
+
+    GGML_ASSERT(tensors_attn.empty());
+    GGML_ASSERT(tensors_mlp.empty());
+    GGML_ASSERT(ctxs.empty());
+    GGML_ASSERT(bufs.empty());
+
+    // create a context for each buffer type
+    std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = {
+                .mem_size   = hparams.n_layer*ggml_tensor_overhead()*2,  // x2 for attn and mlp
+                .mem_buffer = NULL,
+                .no_alloc   = true,
+            };
+
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                return nullptr;
+            }
+
+            ctx_map[buft] = ctx;
+            ctxs.emplace_back(ctx);
+
+            return ctx;
+        }
+
+        return it->second;
+    };
+
+    // make tensors for attention
+    tensors_attn.reserve(hparams.n_layer);
+    tensors_attn.push_back(nullptr); // layer 0
+    for (size_t il = 1; il < hparams.n_layer; il++) {
+        ggml_backend_buffer_type_t buft = model.select_buft(il);
+        ggml_context * ctx = ctx_for_buft(buft);
+        if (!ctx) {
+            LLAMA_LOG_ERROR("%s: failed to allocate context for FINTs attention vector\n", __func__);
+            return false;
+        }
+        ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hparams.n_embd);
+        tensors_attn.push_back(tensor);
+    }
+
+    // make tensors for MLP
+    tensors_mlp.reserve(hparams.n_layer);
+    tensors_mlp.push_back(nullptr); // layer 0
+    for (size_t il = 1; il < hparams.n_layer; il++) {
+        ggml_backend_buffer_type_t buft = model.select_buft(il);
+        ggml_context * ctx = ctx_for_buft(buft);
+        if (!ctx) {
+            LLAMA_LOG_ERROR("%s: failed to allocate context for FINTs MLP vector\n", __func__);
+            return false;
+        }
+        ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hparams.n_embd);
+        tensors_mlp.push_back(tensor);
+    }
+
+    // allocate tensors / buffers and zero
+    bufs.reserve(ctx_map.size());
+    for (auto it : ctx_map) {
+        ggml_backend_buffer_type_t buft = it.first;
+        ggml_context * ctx = it.second;
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (!buf) {
+            LLAMA_LOG_ERROR("%s: failed to allocate buffer for FINTs control vectors\n", __func__);
+            return false;
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        bufs.emplace_back(buf);
+    }
+
+    return true;
+}
+
+bool llama_adapter_cvec::apply_fints(
+        const llama_model & model,
+        const float * attn_data,
+        const float * mlp_data,
+        size_t len,
+        int32_t n_embd,
+        int32_t il_start,
+        int32_t il_end) {
+    const auto & hparams = model.hparams;
+
+    if (attn_data == nullptr || mlp_data == nullptr) {
+        // disable the current control vector
+        layer_start = -1;
+        layer_end   = -1;
+        use_fints = false;
+        return true;
+    }
+
+    if (n_embd != (int) hparams.n_embd) {
+        LLAMA_LOG_ERROR("%s: FINTs control vector n_embd does not match model\n", __func__);
+        return false;
+    }
+
+    if (tensors_attn.empty() || tensors_mlp.empty()) {
+        if (!init_fints(model)) {
+            return false;
+        }
+    }
+
+    layer_start = il_start;
+    layer_end   = il_end;
+    use_fints = true;
+
+    // Copy attention vectors
+    // Note: data should be laid out as [layer_1, layer_2, ..., layer_n-1]
+    // tensors_attn[0] is nullptr (layer 0 never used), so we copy from data[(il-1)*n_embd] to tensors_attn[il]
+    for (size_t il = 1; il < hparams.n_layer; il++) {
+        assert(tensors_attn[il] != nullptr);
+
+        const size_t off = n_embd * (il - 1);  // buffer doesn't have data for layer 0
+        if (off + n_embd <= len) {
+            ggml_backend_tensor_set(tensors_attn[il], attn_data + off, 0, n_embd * ggml_element_size(tensors_attn[il]));
+        }
+    }
+
+    // Copy MLP vectors  
+    // Same layout: data[(il-1)*n_embd] goes to tensors_mlp[il]
+    for (size_t il = 1; il < hparams.n_layer; il++) {
+        assert(tensors_mlp[il] != nullptr);
+
+        const size_t off = n_embd * (il - 1);  // buffer doesn't have data for layer 0
+        if (off + n_embd <= len) {
+            ggml_backend_tensor_set(tensors_mlp[il], mlp_data + off, 0, n_embd * ggml_element_size(tensors_mlp[il]));
         }
     }
 

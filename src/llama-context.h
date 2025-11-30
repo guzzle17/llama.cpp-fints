@@ -96,6 +96,25 @@ struct llama_context {
                 int32_t   il_start,
                 int32_t   il_end);
 
+    bool apply_adapter_cvec_fints(
+            const float * attn_data,
+            const float * mlp_data,
+                 size_t   len,
+                int32_t   n_embd,
+                int32_t   il_start,
+                int32_t   il_end);
+
+    // FINTs: Activation extraction
+    void set_activation_extraction(bool enabled);
+    void clear_activations();
+    const llama_activation_extractor * get_activation_extractor() const;
+    
+    static void compute_fints_vectors(
+            const llama_activation_extractor & positive,
+            const llama_activation_extractor & negative,
+            std::vector<float> & attn_vec_out,
+            std::vector<float> & mlp_vec_out);
+
     // process a single ubatch with a specific graph type
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation
@@ -233,6 +252,8 @@ private:
     llama_cparams       cparams;
     llama_adapter_cvec  cvec;
     llama_adapter_loras loras;
+    
+    llama_activation_extractor extractor; // FINTs: activation extraction
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 

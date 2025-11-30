@@ -84,6 +84,9 @@ llm_build_llama::llm_build_llama(const llama_model & model, const llm_graph_para
                     model.layers[il].wo, model.layers[il].bo,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(cur, "attn_out", il);
+
+            // FINTs: Apply attention steering vector
+            cur = build_cvec_attn(cur, il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
@@ -107,6 +110,9 @@ llm_build_llama::llm_build_llama(const llama_model & model, const llm_graph_para
                     NULL,
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
+
+            // FINTs: Apply MLP steering vector
+            cur = build_cvec_mlp(cur, il);
         } else {
             // MoE branch
             cur = build_norm(ffn_inp,
@@ -126,6 +132,9 @@ llm_build_llama::llm_build_llama(const llama_model & model, const llm_graph_para
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                     il);
             cb(cur, "ffn_moe_out", il);
+
+            // FINTs: Apply MLP steering vector
+            cur = build_cvec_mlp(cur, il);
         }
         cur = ggml_add(ctx0, cur, ffn_inp);
         cb(cur, "ffn_out", il);

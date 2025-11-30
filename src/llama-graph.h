@@ -599,6 +599,15 @@ struct llm_graph_context {
              ggml_tensor * cur,
                      int   il) const;
 
+    // FINTs: fine-grained control vectors
+    ggml_tensor * build_cvec_attn(
+             ggml_tensor * cur,
+                     int   il) const;
+
+    ggml_tensor * build_cvec_mlp(
+             ggml_tensor * cur,
+                     int   il) const;
+
     // do mat_mul, while optionally apply lora
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,

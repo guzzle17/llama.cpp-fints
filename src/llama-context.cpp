@@ -742,6 +742,68 @@ void llama_context::clear_adapter_lora() {
     loras.clear();
 }
 
+// FINTs: Eval callback for extracting activations during graph execution
+static bool fints_extraction_callback(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * ext = (llama_activation_extractor *) user_data;
+    
+    if (!ext->enabled || !t) {
+        return ask ? false : true;
+    }
+    
+    // Parse tensor name to find layer number and type
+    // Expected names: "attn_out-N" or "ffn_out-N" where N is layer number
+    const char * name = t->name;
+    int il = -1;
+    bool is_attn = false;
+    
+    if (strstr(name, "attn_out-") == name) {
+        il = atoi(name + 9); // Skip "attn_out-"
+        is_attn = true;
+    } else if (strstr(name, "ffn_out-") == name) {
+        il = atoi(name + 8); // Skip "ffn_out-"
+        is_attn = false;
+    }
+    
+    if (il < 0 || il >= ext->n_layer) {
+        return ask ? false : true;
+    }
+    
+    if (ask) {
+        // Yes, we want this tensor's data
+        return true;
+    }
+    
+    // ask=false means data is ready, extract it now!
+    int64_t n_tok = t->ne[1];
+    int64_t n_emb = t->ne[0];
+    
+    if (n_tok <= 0 || n_emb != ext->n_embd) {
+        return true;  // Invalid dimensions, continue
+    }
+    
+    // Allocate buffer and copy data IMMEDIATELY
+    std::vector<float> buffer(n_tok * n_emb);
+    
+    // Check if host or device memory
+    const bool is_host = ggml_backend_buffer_is_host(t->buffer);
+    if (is_host) {
+        // Direct copy from host memory
+        std::memcpy(buffer.data(), t->data, buffer.size() * sizeof(float));
+    } else {
+        // Copy from device memory
+        ggml_backend_tensor_get(t, buffer.data(), 0, buffer.size() * sizeof(float));
+    }
+    
+    // Save to extractor
+    if (is_attn) {
+        ext->save_attn(il, buffer.data(), n_tok, n_emb);
+    } else {
+        ext->save_mlp(il, buffer.data(), n_tok, n_emb);
+    }
+    
+    return true;  // Continue execution
+}
+
 bool llama_context::apply_adapter_cvec(
             const float * data,
                  size_t   len,
@@ -751,6 +813,42 @@ bool llama_context::apply_adapter_cvec(
     LLAMA_LOG_DEBUG("%s: il_start = %d, il_end = %d\n", __func__, il_start, il_end);
 
     return cvec.apply(model, data, len, n_embd, il_start, il_end);
+}
+
+bool llama_context::apply_adapter_cvec_fints(
+            const float * attn_data,
+            const float * mlp_data,
+                 size_t   len,
+                int32_t   n_embd,
+                int32_t   il_start,
+                int32_t   il_end) {
+    LLAMA_LOG_DEBUG("%s: FINTs il_start = %d, il_end = %d\n", __func__, il_start, il_end);
+
+    return cvec.apply_fints(model, attn_data, mlp_data, len, n_embd, il_start, il_end);
+}
+
+void llama_context::set_activation_extraction(bool enabled) {
+    if (enabled && !extractor.enabled) {
+        const auto & hparams = model.hparams;
+        extractor.init(hparams.n_layer, hparams.n_embd);
+    }
+    extractor.enabled = enabled;
+}
+
+void llama_context::clear_activations() {
+    extractor.clear();
+}
+
+const llama_activation_extractor * llama_context::get_activation_extractor() const {
+    return &extractor;
+}
+
+void llama_context::compute_fints_vectors(
+        const llama_activation_extractor & positive,
+        const llama_activation_extractor & negative,
+        std::vector<float> & attn_vec_out,
+        std::vector<float> & mlp_vec_out) {
+    llama_activation_extractor::compute_vectors(positive, negative, attn_vec_out, mlp_vec_out);
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
@@ -775,7 +873,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -794,6 +891,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+    }
+
+    // FINTs: Set extraction callback EVERY time (not just on graph rebuild)
+    if (extractor.enabled) {
+        ggml_backend_sched_set_eval_callback(sched.get(), fints_extraction_callback, const_cast<llama_activation_extractor*>(&extractor));
+    } else if (cparams.cb_eval) {
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
     }
 
     // set the input data for the input tensors
@@ -1492,11 +1596,26 @@ ggml_status llama_context::graph_compute(
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
-    return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+    // Capture non-const pointer to extractor to allow modification
+    auto * ext = const_cast<llama_activation_extractor*>(&extractor);
+    
+    return [this, ext](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        // FINTs: Mark tensors for extraction
+        if (ext->enabled && il >= 0 && il < ext->n_layer) {
+            if (strcmp(name, "attn_out") == 0) {
+                // Capture attention output tensor
+                ext->attn_tensors[il] = cur;
+            } 
+            else if (strcmp(name, "ffn_out") == 0 && ext->mlp_tensors[il] == nullptr) {
+                // Capture FIRST ffn_out (actual MLP output, not after residual)
+                ext->mlp_tensors[il] = cur;
+            }
         }
 
         if (!cparams.offload_kqv) {
@@ -2532,6 +2651,111 @@ int32_t llama_apply_adapter_cvec(
     bool res = ctx->apply_adapter_cvec(data, len, n_embd, il_start, il_end);
 
     return res ? 0 : -1;
+}
+
+int32_t llama_apply_adapter_cvec_fints(
+        llama_context * ctx,
+                 const float * attn_data,
+                 const float * mlp_data,
+                      size_t   len,
+                     int32_t   n_embd,
+                     int32_t   il_start,
+                     int32_t   il_end) {
+    bool res = ctx->apply_adapter_cvec_fints(attn_data, mlp_data, len, n_embd, il_start, il_end);
+
+    return res ? 0 : -1;
+}
+
+void llama_set_activation_extraction(llama_context * ctx, bool enabled) {
+    ctx->set_activation_extraction(enabled);
+}
+
+void llama_clear_activations(llama_context * ctx) {
+    ctx->clear_activations();
+}
+
+void llama_get_activation_info(llama_context * ctx, int32_t * n_layer, int32_t * n_embd) {
+    const auto * extractor = ctx->get_activation_extractor();
+    if (n_layer) *n_layer = extractor->n_layer;
+    if (n_embd) *n_embd = extractor->n_embd;
+}
+
+int32_t llama_get_layer_activations(
+        llama_context * ctx,
+                 int32_t   layer,
+                   float * attn_out,
+                   float * mlp_out,
+                  size_t   buffer_size) {
+    const auto * extractor = ctx->get_activation_extractor();
+    
+    if (layer < 0 || layer >= extractor->n_layer) {
+        return -1;
+    }
+    
+    int32_t n_tokens = extractor->token_counts[layer];
+    size_t required_size = extractor->n_embd * sizeof(float); // Only need space for averaged vector
+    
+    if (buffer_size < required_size) {
+        return -1;
+    }
+    
+    // Return mean activation across all tokens for this layer
+    if (attn_out && !extractor->attn_activations[layer].empty() && n_tokens > 0) {
+        const float * data = extractor->attn_activations[layer].data();
+        for (int i = 0; i < extractor->n_embd; i++) {
+            float sum = 0.0f;
+            for (int t = 0; t < n_tokens; t++) {
+                sum += data[t * extractor->n_embd + i];
+            }
+            attn_out[i] = sum / n_tokens;
+        }
+    }
+    
+    if (mlp_out && !extractor->mlp_activations[layer].empty() && n_tokens > 0) {
+        const float * data = extractor->mlp_activations[layer].data();
+        for (int i = 0; i < extractor->n_embd; i++) {
+            float sum = 0.0f;
+            for (int t = 0; t < n_tokens; t++) {
+                sum += data[t * extractor->n_embd + i];
+            }
+            mlp_out[i] = sum / n_tokens;
+        }
+    }
+    
+    return n_tokens;
+}
+
+bool llama_compute_fints_vectors(
+        llama_context * pos_ctx,
+        llama_context * neg_ctx,
+                   float * attn_vec_out,
+                   float * mlp_vec_out,
+                  size_t   buffer_size) {
+    try {
+        const auto * pos_extractor = pos_ctx->get_activation_extractor();
+        const auto * neg_extractor = neg_ctx->get_activation_extractor();
+        
+        if (pos_extractor->n_layer != neg_extractor->n_layer || 
+            pos_extractor->n_embd != neg_extractor->n_embd) {
+            return false;
+        }
+        
+        size_t required_size = pos_extractor->n_layer * pos_extractor->n_embd * sizeof(float);
+        if (buffer_size < required_size) {
+            return false;
+        }
+        
+        std::vector<float> attn_vec, mlp_vec;
+        llama_context::compute_fints_vectors(*pos_extractor, *neg_extractor, attn_vec, mlp_vec);
+        
+        std::memcpy(attn_vec_out, attn_vec.data(), required_size);
+        std::memcpy(mlp_vec_out, mlp_vec.data(), required_size);
+        
+        return true;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return false;
+    }
 }
 
 //
